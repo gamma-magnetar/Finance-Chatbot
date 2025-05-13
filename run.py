@@ -36,7 +36,7 @@ def start_streamlit():
     try:
         # Run the Streamlit app
         subprocess.run([
-            "streamlit", "run", 
+            "Streamlit", "run", 
             "app.py",
             "--server.port", "5000",
             "--server.address", "0.0.0.0"
