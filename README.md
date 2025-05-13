@@ -35,3 +35,4 @@ The platform outputs a detailed multi-agent conversation log where agents analyz
 This project has been deployed on streamlit.
 
 URL :   https://finance-chatbot-mohit-laddha.streamlit.app/
+static URL : https://finance-chatbot-mohit-st.streamlit.app/
