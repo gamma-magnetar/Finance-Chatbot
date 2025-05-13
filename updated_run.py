@@ -32,21 +32,20 @@ def start_orchestrator():
 
 def start_streamlit():
 """Start the Streamlit frontend."""
+   """Start the Streamlit frontend."""
     logger.info("Starting Streamlit frontend...")
     try:
-        # Run the Streamlit app
         # Run the Streamlit app - using streamlit_app.py instead of app.py to avoid audio_recorder issues
+        # Run the Streamlit app - using deployment_app.py for production deployment
+        # This version has no API dependencies and runs completely standalone
         subprocess.run([
             "streamlit", "run", 
-            "app.py",
-            "streamlit_app.py",
+            "Streamlit_app.py",
+            "deployment_app.py",
             "--server.port", "5000",
             "--server.address", "0.0.0.0"
         ])
-    except Exception as e:
-        logger.error(f"Error starting Streamlit: {str(e)}")
-        sys.exit(1)
-
+        
 def handle_exit(signum, frame):
     """Handle exit signals."""
     logger.info("Shutting down Finance Assistant...")
