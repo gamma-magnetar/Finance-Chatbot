@@ -1,0 +1,262 @@
+"""
+Document Loader for the Finance Assistant.
+Handles loading and processing of financial documents.
+"""
+
+import os
+import logging
+import requests
+import tempfile
+from typing import Dict, List, Any, Optional
+from bs4 import BeautifulSoup
+import trafilatura
+import re
+
+logger = logging.getLogger(__name__)
+
+class DocumentLoader:
+    """
+    Class for loading and processing financial documents from various sources.
+    """
+    
+    def __init__(self):
+        """Initialize the document loader."""
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+    
+    def load_web_page(self, url: str) -> str:
+        """
+        Load text content from a web page.
+        
+        Args:
+            url: URL of the web page
+            
+        Returns:
+            Extracted text content
+        """
+        try:
+            # Get the web page content
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            
+            # Extract text using trafilatura
+            text = trafilatura.extract(response.text)
+            
+            if not text:
+                # Fallback to BeautifulSoup
+                soup = BeautifulSoup(response.text, 'html.parser')
+                text = soup.get_text(separator='\n')
+            
+            return text
+        except Exception as e:
+            logger.error(f"Error loading web page {url}: {str(e)}")
+            return ""
+    
+    def load_sec_filing(self, ticker: str, form_type: str = "10-K") -> Dict[str, Any]:
+        """
+        Load SEC filing for a company.
+        
+        Args:
+            ticker: Company ticker symbol
+            form_type: SEC form type (e.g., 10-K, 10-Q)
+            
+        Returns:
+            Dictionary with filing information and content
+        """
+        try:
+            # Get CIK number for ticker
+            ticker_lookup_url = "https://www.sec.gov/include/ticker.txt"
+            response = requests.get(ticker_lookup_url, headers=self.headers)
+            response.raise_for_status()
+            
+            # Parse the ticker to CIK mapping
+            ticker_to_cik = {}
+            for line in response.text.split('\n'):
+                if ':' in line:
+                    t, cik = line.strip().split(':')
+                    ticker_to_cik[t.upper()] = cik
+            
+            if ticker.upper() not in ticker_to_cik:
+                logger.error(f"CIK not found for ticker {ticker}")
+                return {"error": f"CIK not found for ticker {ticker}"}
+            
+            cik = ticker_to_cik[ticker.upper()]
+            padded_cik = cik.zfill(10)  # CIKs need to be 10 digits with leading zeros
+            
+            # Get filings metadata
+            submissions_url = f"https://data.sec.gov/submissions/CIK{padded_cik}.json"
+            response = requests.get(submissions_url, headers=self.headers)
+            
+            if response.status_code != 200:
+                logger.error(f"Error getting SEC submissions for {ticker}: {response.status_code}")
+                return {"error": f"Error getting SEC submissions: {response.status_code}"}
+            
+            data = response.json()
+            
+            # Find the most recent filing of the requested type
+            filings = data.get('filings', {}).get('recent', {})
+            
+            if not filings:
+                return {"error": "No filings found"}
+            
+            # Get the indices of all filings of the requested type
+            indices = [i for i, form in enumerate(filings.get('form', [])) if form == form_type]
+            
+            if not indices:
+                return {"error": f"No {form_type} filings found"}
+            
+            # Get the most recent filing
+            idx = indices[0]
+            accession_number = filings['accessionNumber'][idx]
+            filing_date = filings['filingDate'][idx]
+            
+            # Format the accession number for the URL
+            accession_number_formatted = accession_number.replace('-', '')
+            
+            # Get the filing document
+            filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number_formatted}/{accession_number}.txt"
+            response = requests.get(filing_url, headers=self.headers)
+            
+            if response.status_code != 200:
+                logger.error(f"Error getting filing content: {response.status_code}")
+                return {"error": f"Error getting filing content: {response.status_code}"}
+            
+            # Extract text content
+            text = response.text
+            
+            # Try to clean up the content (very simplified)
+            # SEC filings are complex and might need more sophisticated parsing
+            soup = BeautifulSoup(text, 'html.parser')
+            clean_text = soup.get_text(separator='\n')
+            
+            # Limit the size to avoid overwhelming the system
+            if len(clean_text) > 100000:
+                clean_text = clean_text[:100000] + "\n...[truncated]"
+            
+            return {
+                "ticker": ticker,
+                "form_type": form_type,
+                "accession_number": accession_number,
+                "filing_date": filing_date,
+                "filing_url": filing_url,
+                "content": clean_text
+            }
+            
+        except Exception as e:
+            logger.error(f"Error loading SEC filing for {ticker}: {str(e)}")
+            return {"error": str(e)}
+    
+    def load_financial_news(self, source: str = "yahoo", topic: str = None) -> List[Dict[str, Any]]:
+        """
+        Load financial news articles.
+        
+        Args:
+            source: News source (yahoo, reuters, bloomberg)
+            topic: Optional topic to filter by
+            
+        Returns:
+            List of news articles
+        """
+        try:
+            url = ""
+            if source.lower() == "yahoo":
+                url = "https://finance.yahoo.com/news"
+                if topic:
+                    url = f"https://finance.yahoo.com/topic/{topic}"
+            elif source.lower() == "reuters":
+                url = "https://www.reuters.com/business"
+                if topic:
+                    url = f"https://www.reuters.com/business/{topic}"
+            elif source.lower() == "bloomberg":
+                url = "https://www.bloomberg.com/markets"
+                if topic:
+                    url = f"https://www.bloomberg.com/topics/{topic}"
+            else:
+                return [{"error": f"Unsupported news source: {source}"}]
+            
+            # Get the news page
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            articles = []
+            
+            if source.lower() == "yahoo":
+                # Parse Yahoo Finance news
+                news_items = soup.find_all('h3')
+                
+                for item in news_items[:10]:  # Limit to 10 articles
+                    link = item.find('a')
+                    if link and link.has_attr('href'):
+                        href = link['href']
+                        if href.startswith('/'):
+                            href = f"https://finance.yahoo.com{href}"
+                        
+                        articles.append({
+                            "title": item.text.strip(),
+                            "url": href,
+                            "source": "Yahoo Finance"
+                        })
+            
+            elif source.lower() == "reuters":
+                # Parse Reuters news
+                news_items = soup.find_all('article')
+                
+                for item in news_items[:10]:
+                    headline = item.find('h3')
+                    if headline:
+                        link = headline.find('a')
+                        if link and link.has_attr('href'):
+                            href = link['href']
+                            if not href.startswith('http'):
+                                href = f"https://www.reuters.com{href}"
+                            
+                            articles.append({
+                                "title": headline.text.strip(),
+                                "url": href,
+                                "source": "Reuters"
+                            })
+            
+            elif source.lower() == "bloomberg":
+                # Parse Bloomberg news
+                news_items = soup.find_all('article')
+                
+                for item in news_items[:10]:
+                    headline = item.find('h3')
+                    if headline:
+                        link = headline.find('a')
+                        if link and link.has_attr('href'):
+                            href = link['href']
+                            if not href.startswith('http'):
+                                href = f"https://www.bloomberg.com{href}"
+                            
+                            articles.append({
+                                "title": headline.text.strip(),
+                                "url": href,
+                                "source": "Bloomberg"
+                            })
+            
+            return articles
+            
+        except Exception as e:
+            logger.error(f"Error loading financial news from {source}: {str(e)}")
+            return [{"error": str(e)}]
+    
+    def get_article_content(self, url: str) -> str:
+        """
+        Get the content of a news article.
+        
+        Args:
+            url: URL of the article
+            
+        Returns:
+            Article text content
+        """
+        try:
+            # Load the web page
+            return self.load_web_page(url)
+        except Exception as e:
+            logger.error(f"Error getting article content from {url}: {str(e)}")
+            return f"Error: {str(e)}"
