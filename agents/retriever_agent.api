@@ -1,0 +1,436 @@
+"""
+Retriever Agent for the Finance Assistant.
+Handles indexing embeddings in vector database and retrieving relevant information.
+"""
+
+import os
+import logging
+import numpy as np
+import faiss
+from typing import List, Dict, Any, Optional, Tuple, Union
+import pandas as pd
+import pickle
+import json
+import time
+from datetime import datetime
+import hashlib
+from openai import OpenAI
+import requests
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.document_loaders import TextLoader
+from langchain.vectorstores import FAISS as LangchainFAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+
+logger = logging.getLogger(__name__)
+
+class RetrieverAgent:
+    """
+    Agent responsible for indexing and retrieving information from vector database.
+    Uses FAISS for vector storage and OpenAI embeddings for text representation.
+    """
+    
+    def __init__(self, embeddings_model: str = "text-embedding-ada-002"):
+        """
+        Initialize the retriever agent.
+        
+        Args:
+            embeddings_model: OpenAI model for generating embeddings
+        """
+        self.api_key = os.environ.get("OPENAI_API_KEY")
+        self.client = OpenAI(api_key=self.api_key)
+        self.embeddings_model = embeddings_model
+        self.embeddings = OpenAIEmbeddings(openai_api_key=self.api_key)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+        )
+        self.vector_store = None
+        self.index_path = "data/vector_store"
+        self.cache = {}
+        
+        # Ensure data directory exists
+        os.makedirs("data", exist_ok=True)
+        
+        # Load existing index if available
+        self._load_or_create_index()
+    
+    def _load_or_create_index(self):
+        """Load existing index or create a new one if it doesn't exist."""
+        try:
+            if os.path.exists(f"{self.index_path}.faiss") and os.path.exists(f"{self.index_path}.pkl"):
+                self.vector_store = LangchainFAISS.load_local(
+                    self.index_path,
+                    self.embeddings
+                )
+                logger.info("Loaded existing vector store")
+            else:
+                # Create an empty index
+                self.vector_store = LangchainFAISS.from_texts(
+                    ["Initial document"], self.embeddings
+                )
+                # Save the empty index
+                self.vector_store.save_local(self.index_path)
+                logger.info("Created new vector store")
+        except Exception as e:
+            logger.error(f"Error loading vector store: {str(e)}")
+            # Create an empty index as fallback
+            self.vector_store = LangchainFAISS.from_texts(
+                ["Initial document"], self.embeddings
+            )
+    
+    def get_embedding(self, text: str) -> List[float]:
+        """
+        Get embedding vector for a text.
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            Embedding vector
+        """
+        # Create a cache key based on text hash
+        cache_key = hashlib.md5(text.encode()).hexdigest()
+        
+        # Check if we have this embedding cached
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        try:
+            # Get embedding from OpenAI
+            response = self.client.embeddings.create(
+                model=self.embeddings_model,
+                input=text
+            )
+            
+            embedding = response.data[0].embedding
+            
+            # Cache the result
+            self.cache[cache_key] = embedding
+            
+            return embedding
+        except Exception as e:
+            logger.error(f"Error getting embedding: {str(e)}")
+            raise
+    
+    def add_documents(self, texts: List[str], metadata: List[Dict[str, Any]] = None) -> bool:
+        """
+        Add documents to the vector store.
+        
+        Args:
+            texts: List of text documents to add
+            metadata: Optional metadata for each document
+            
+        Returns:
+            Success flag
+        """
+        if metadata is None:
+            metadata = [{"source": f"doc_{i}", "timestamp": datetime.now().isoformat()} for i in range(len(texts))]
+        
+        try:
+            # Split texts into chunks
+            docs = []
+            for i, text in enumerate(texts):
+                chunks = self.text_splitter.split_text(text)
+                for j, chunk in enumerate(chunks):
+                    chunk_metadata = metadata[i].copy()
+                    chunk_metadata["chunk"] = j
+                    docs.append(Document(page_content=chunk, metadata=chunk_metadata))
+            
+            # Add to vector store
+            if not self.vector_store:
+                # Create new vector store
+                self.vector_store = LangchainFAISS.from_documents(
+                    docs, self.embeddings
+                )
+            else:
+                # Add to existing vector store
+                self.vector_store.add_documents(docs)
+            
+            # Save the updated index
+            self.vector_store.save_local(self.index_path)
+            
+            logger.info(f"Added {len(texts)} documents to vector store")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding documents to vector store: {str(e)}")
+            return False
+    
+    def add_from_api_agent(self, api_agent, tickers: List[str]) -> bool:
+        """
+        Add stock data from API agent to vector store.
+        
+        Args:
+            api_agent: API agent instance
+            tickers: List of stock tickers to add
+            
+        Returns:
+            Success flag
+        """
+        try:
+            texts = []
+            metadata = []
+            
+            # Get stock data for each ticker
+            for ticker in tickers:
+                # Get stock price data
+                stock_data = api_agent.get_stock_data(ticker, period="1mo")
+                
+                # Format stock data as text
+                if not stock_data.empty:
+                    text = f"Stock data for {ticker} as of {datetime.now().strftime('%Y-%m-%d')}:\n"
+                    text += f"Current price: {stock_data.iloc[-1]['Close']:.2f}\n"
+                    text += f"Daily change: {(stock_data.iloc[-1]['Close'] - stock_data.iloc[-2]['Close']):.2f} "
+                    text += f"({(stock_data.iloc[-1]['Close'] - stock_data.iloc[-2]['Close']) / stock_data.iloc[-2]['Close'] * 100:.2f}%)\n"
+                    text += f"52-week high: {stock_data['High'].max():.2f}\n"
+                    text += f"52-week low: {stock_data['Low'].min():.2f}\n"
+                    text += f"Average volume: {stock_data['Volume'].mean():.0f}\n"
+                    
+                    texts.append(text)
+                    metadata.append({
+                        "source": f"api_stock_{ticker}",
+                        "ticker": ticker,
+                        "type": "stock_data",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                
+                # Get stock news
+                news = api_agent.get_stock_news(ticker)
+                
+                if news:
+                    news_text = f"Recent news for {ticker}:\n"
+                    for item in news:
+                        news_text += f"- {item['title']} ({item['published']})\n"
+                    
+                    texts.append(news_text)
+                    metadata.append({
+                        "source": f"api_news_{ticker}",
+                        "ticker": ticker,
+                        "type": "stock_news",
+                        "timestamp": datetime.now().isoformat()
+                    })
+            
+            # Add to vector store
+            return self.add_documents(texts, metadata)
+            
+        except Exception as e:
+            logger.error(f"Error adding API data to vector store: {str(e)}")
+            return False
+    
+    def add_from_scraping_agent(self, scraping_agent, tickers: List[str]) -> bool:
+        """
+        Add financial filings from scraping agent to vector store.
+        
+        Args:
+            scraping_agent: Scraping agent instance
+            tickers: List of stock tickers to add
+            
+        Returns:
+            Success flag
+        """
+        try:
+            texts = []
+            metadata = []
+            
+            # Get SEC filings for each ticker
+            for ticker in tickers:
+                filings = scraping_agent.get_sec_filings(ticker, "10-K")
+                
+                for filing in filings[:1]:  # Just the most recent 10-K
+                    # Get filing content
+                    content = scraping_agent.get_filing_content(filing['link'])
+                    
+                    if content:
+                        # Limit content length to avoid issues
+                        content = content[:100000] if len(content) > 100000 else content
+                        
+                        texts.append(content)
+                        metadata.append({
+                            "source": f"sec_{ticker}_{filing['form']}",
+                            "ticker": ticker,
+                            "type": "sec_filing",
+                            "form": filing['form'],
+                            "filing_date": filing['filing_date'],
+                            "timestamp": datetime.now().isoformat()
+                        })
+            
+            # Get financial news
+            news = scraping_agent.get_financial_news()
+            
+            if news:
+                news_text = "Recent financial news:\n"
+                for item in news:
+                    news_text += f"- [{item['source']}] {item['title']} ({item['published']})\n"
+                
+                texts.append(news_text)
+                metadata.append({
+                    "source": "financial_news",
+                    "type": "news",
+                    "timestamp": datetime.now().isoformat()
+                })
+            
+            # Get market sentiment
+            tech_sentiment = scraping_agent.get_market_sentiment("tech")
+            asia_sentiment = scraping_agent.get_market_sentiment("asia")
+            
+            if tech_sentiment:
+                sentiment_text = f"Tech market sentiment: {tech_sentiment['sentiment']}\n"
+                sentiment_text += f"Sentiment score: {tech_sentiment['sentiment_score']}\n"
+                sentiment_text += f"Based on {tech_sentiment['total_relevant_articles']} articles.\n"
+                
+                texts.append(sentiment_text)
+                metadata.append({
+                    "source": "tech_sentiment",
+                    "type": "sentiment",
+                    "keyword": "tech",
+                    "timestamp": datetime.now().isoformat()
+                })
+            
+            if asia_sentiment:
+                sentiment_text = f"Asia market sentiment: {asia_sentiment['sentiment']}\n"
+                sentiment_text += f"Sentiment score: {asia_sentiment['sentiment_score']}\n"
+                sentiment_text += f"Based on {asia_sentiment['total_relevant_articles']} articles.\n"
+                
+                texts.append(sentiment_text)
+                metadata.append({
+                    "source": "asia_sentiment",
+                    "type": "sentiment",
+                    "keyword": "asia",
+                    "timestamp": datetime.now().isoformat()
+                })
+            
+            # Add to vector store
+            return self.add_documents(texts, metadata)
+            
+        except Exception as e:
+            logger.error(f"Error adding scraped data to vector store: {str(e)}")
+            return False
+    
+    def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Retrieve the most relevant documents for a query.
+        
+        Args:
+            query: Search query
+            k: Number of documents to retrieve
+            
+        Returns:
+            List of documents with content and metadata
+        """
+        try:
+            if not self.vector_store:
+                logger.error("Vector store not initialized")
+                return []
+                
+            # Get relevant documents
+            docs = self.vector_store.similarity_search(query, k=k)
+            
+            # Format results
+            results = []
+            for doc in docs:
+                results.append({
+                    "content": doc.page_content,
+                    "metadata": doc.metadata
+                })
+                
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving documents: {str(e)}")
+            return []
+    
+    def retrieve_mmr(self, query: str, k: int = 5, diversity: float = 0.7) -> List[Dict[str, Any]]:
+        """
+        Retrieve documents using Maximum Marginal Relevance for diversity.
+        
+        Args:
+            query: Search query
+            k: Number of documents to retrieve
+            diversity: Diversity factor (0 = max relevance, 1 = max diversity)
+            
+        Returns:
+            List of documents with content and metadata
+        """
+        try:
+            if not self.vector_store:
+                logger.error("Vector store not initialized")
+                return []
+                
+            # Get relevant documents with MMR
+            docs = self.vector_store.max_marginal_relevance_search(query, k=k, fetch_k=k*2, lambda_mult=diversity)
+            
+            # Format results
+            results = []
+            for doc in docs:
+                results.append({
+                    "content": doc.page_content,
+                    "metadata": doc.metadata
+                })
+                
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving documents with MMR: {str(e)}")
+            return []
+    
+    def retrieve_by_type(self, query: str, doc_type: str, k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Retrieve documents of a specific type.
+        
+        Args:
+            query: Search query
+            doc_type: Document type to filter by
+            k: Number of documents to retrieve
+            
+        Returns:
+            List of documents with content and metadata
+        """
+        try:
+            if not self.vector_store:
+                logger.error("Vector store not initialized")
+                return []
+            
+            # Build filter
+            metadata_filter = {"type": doc_type}
+            
+            # Get relevant documents
+            docs = self.vector_store.similarity_search(
+                query, 
+                k=k,
+                filter=metadata_filter
+            )
+            
+            # Format results
+            results = []
+            for doc in docs:
+                results.append({
+                    "content": doc.page_content,
+                    "metadata": doc.metadata
+                })
+                
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving documents by type: {str(e)}")
+            return []
+    
+    def retrieve_for_topic(self, topic: str) -> Dict[str, Any]:
+        """
+        Retrieve information for a specific topic like Asia tech stocks.
+        
+        Args:
+            topic: Topic to search for
+            
+        Returns:
+            Dict with relevant information
+        """
+        try:
+            results = {
+                "stock_data": self.retrieve_by_type(f"{topic} stock data", "stock_data", k=3),
+                "news": self.retrieve_by_type(f"{topic} news", "stock_news", k=3),
+                "sentiment": self.retrieve_by_type(f"{topic} sentiment", "sentiment", k=1),
+                "filings": self.retrieve_by_type(f"{topic} filings", "sec_filing", k=1)
+            }
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving data for topic {topic}: {str(e)}")
+            return {}
