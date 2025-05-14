@@ -16,7 +16,10 @@ st.set_page_config(
 )
 
 # Set up API endpoints
-ORCHESTRATOR_URL = "http://localhost:8000"
+# ORCHESTRATOR_URL = "http://localhost:8000"
+# Using 0.0.0.0 instead of localhost for proper container networking
+ORCHESTRATOR_URL = "http://0.0.0.0:8000"
+
 
 def get_current_date():
     """Get the current date formatted for display."""
