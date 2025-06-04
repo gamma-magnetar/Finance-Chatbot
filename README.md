@@ -1,7 +1,6 @@
 # Finance-Chatbot
 This is a Finance Chatbot system
 
-URL :   https://finance-chatbot-mohit-laddha.streamlit.app/
 static URL : https://finance-chatbot-mohit-st.streamlit.app/
 
 This project is a multi-agent stock analysis platform built using LangChain, LangGraph, and LLMs. It simulates collaboration between intelligent agents to perform comprehensive stock market analysis, including:
